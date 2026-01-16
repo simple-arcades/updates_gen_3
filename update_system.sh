@@ -19,8 +19,30 @@ fi
 # ----------------------------
 # Config
 # ----------------------------
-UPDATE_BASE_URL="https://raw.githubusercontent.com/simple-arcades/updates_gen_3/main"
+# Base URLs (primary + optional mirrors)
+# Primary should be your main update host. Mirrors are optional; leave blank to disable.
+PRIMARY_BASE_URL="https://raw.githubusercontent.com/simple-arcades/updates_gen_3/main"
+MIRROR1_BASE_URL=""  # e.g. https://raw.githubusercontent.com/simple-arcades/updates_gen_3/main
+MIRROR2_BASE_URL=""
+MIRROR3_BASE_URL=""
 
+# Backward-compatible: existing code paths use UPDATE_BASE_URL
+UPDATE_BASE_URL="$PRIMARY_BASE_URL"
+
+# Optional Basic Auth for hosts that require it (self-host). Not used for GitHub by default.
+AUTH_FILE="/home/pi/RetroPie/custom_scripts/.sa_updater_auth"
+AUTH_REQUIRED_HOSTS=()
+
+# Download progress UI (shown for large downloads only)
+PROGRESS_MIN_BYTES=$((5*1024*1024))
+
+# Internal (set by downloader)
+BASE_URLS_BUILT=0
+LAST_DOWNLOAD_BASE=""
+LAST_DOWNLOAD_URL=""
+LAST_DOWNLOAD_ERROR=""
+SA_USER=""
+SA_PASS=""
 LOCAL_VERSION_FILE="/home/pi/RetroPie/custom_scripts/logs/update_version.log"
 LOG_FILE="/home/pi/RetroPie/custom_scripts/logs/update_system.log"
 HASH_LOG="/home/pi/RetroPie/custom_scripts/logs/update_hashes.log"
@@ -64,6 +86,7 @@ declare -A DIR_PERMISSIONS=(
 declare -A FILE_PERMISSIONS=(
   ["/home/pi/RetroPie/custom_scripts/logs/update_version.log"]="pi:pi 644"
   ["/home/pi/RetroPie/custom_scripts/logs/update_system.log"]="pi:pi 644"
+    ["/home/pi/RetroPie/custom_scripts/.sa_updater_auth"]="root:root 600"
   ["/home/pi/RetroPie/roms/savestates/savefiles/reicast/mslug6.zip.nvmem"]="pi:pi 444"
   ["/home/pi/RetroPie/roms/savestates/savefiles/reicast/mslug6.zip.nvmem2"]="pi:pi 444"
 )
@@ -87,6 +110,89 @@ show_message() {
     dialog --ok-button "OK" --msgbox "$message" 12 70
   else
     echo "$message"
+  fi
+}
+
+# ----------------------------
+# Downloader helpers (mirrors + auth + progress)
+# ----------------------------
+normalize_base_url() {
+  local u="$1"
+  # Trim trailing slashes
+  while [[ "$u" == */ ]]; do u="${u%/}"; done
+  echo "$u"
+}
+
+build_base_urls() {
+  [ "${BASE_URLS_BUILT:-0}" -eq 1 ] && return 0
+
+  PRIMARY_BASE_URL="$(normalize_base_url "$PRIMARY_BASE_URL")"
+  UPDATE_BASE_URL="$PRIMARY_BASE_URL"
+  MIRROR1_BASE_URL="$(normalize_base_url "$MIRROR1_BASE_URL")"
+  MIRROR2_BASE_URL="$(normalize_base_url "$MIRROR2_BASE_URL")"
+  MIRROR3_BASE_URL="$(normalize_base_url "$MIRROR3_BASE_URL")"
+
+  BASE_URLS=()
+  [ -n "$PRIMARY_BASE_URL" ] && BASE_URLS+=("$PRIMARY_BASE_URL")
+  [ -n "$MIRROR1_BASE_URL" ] && BASE_URLS+=("$MIRROR1_BASE_URL")
+  [ -n "$MIRROR2_BASE_URL" ] && BASE_URLS+=("$MIRROR2_BASE_URL")
+  [ -n "$MIRROR3_BASE_URL" ] && BASE_URLS+=("$MIRROR3_BASE_URL")
+
+  BASE_URLS_BUILT=1
+}
+
+url_host() {
+  # Extract host from http(s)://host[:port]/...
+  local u="$1"
+  echo "$u" | awk -F/ '{print $3}' | cut -d: -f1
+}
+
+load_auth() {
+  SA_USER=""
+  SA_PASS=""
+
+  if [ -f "$AUTH_FILE" ]; then
+    # Ensure file is root-only to avoid privilege escalation
+    local owner group perm
+    owner="$(stat -c '%U' "$AUTH_FILE" 2>/dev/null)"
+    group="$(stat -c '%G' "$AUTH_FILE" 2>/dev/null)"
+    perm="$(stat -c '%a' "$AUTH_FILE" 2>/dev/null)"
+    if [ "$owner" != "root" ] || [ "$group" != "root" ] || [ "$perm" != "600" ]; then
+      # Don't auto-fix here; the script will fix declared permissions elsewhere.
+      log_update "Warning: AUTH_FILE permissions not strict (expected root:root 600)."
+    fi
+
+    # shellcheck disable=SC1090
+    . "$AUTH_FILE" >/dev/null 2>&1 || true
+  fi
+}
+
+host_requires_auth() {
+  local h="$1"
+  local x
+  for x in "${AUTH_REQUIRED_HOSTS[@]}"; do
+    [ "$h" = "$x" ] && return 0
+  done
+  return 1
+}
+
+human_bytes() {
+  local bytes="$1"
+  if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+    echo "?"
+    return
+  fi
+  local kib=1024
+  local mib=$((1024*1024))
+  local gib=$((1024*1024*1024))
+  if [ "$bytes" -ge "$gib" ]; then
+    awk -v b="$bytes" 'BEGIN{printf "%.1f GB", b/1024/1024/1024}'
+  elif [ "$bytes" -ge "$mib" ]; then
+    awk -v b="$bytes" 'BEGIN{printf "%.1f MB", b/1024/1024}'
+  elif [ "$bytes" -ge "$kib" ]; then
+    awk -v b="$bytes" 'BEGIN{printf "%.1f KB", b/1024}'
+  else
+    echo "${bytes} B"
   fi
 }
 
@@ -184,25 +290,172 @@ apply_file_permission_overrides() {
   done
 }
 
+
 download_file() {
   local url="$1"
-  local out="$2"
+  local out_path="$2"
 
-  rm -f "$out" >/dev/null 2>&1
-  wget -q \
-    --timeout="$WGET_TIMEOUT" \
-    --tries="$WGET_TRIES" \
-    --dns-timeout="$WGET_TIMEOUT" \
-    --connect-timeout="$WGET_TIMEOUT" \
-    --read-timeout="$WGET_TIMEOUT" \
-    -O "$out" "$url" >/dev/null 2>&1
+  LAST_DOWNLOAD_BASE=""
+  LAST_DOWNLOAD_URL=""
+  LAST_DOWNLOAD_ERROR=""
 
-  if [ $? -ne 0 ] || [ ! -s "$out" ]; then
-    rm -f "$out" >/dev/null 2>&1
+  # Prefer curl (supports HTTPS + Basic Auth cleanly)
+  if ! command -v curl >/dev/null 2>&1; then
+    LAST_DOWNLOAD_ERROR="Missing dependency: curl is not installed."
+    log_update "$LAST_DOWNLOAD_ERROR"
     return 1
   fi
-  return 0
+
+  build_base_urls
+  load_auth
+
+  # Determine relative path if URL is built from primary base
+  local rel=""
+  if [[ "$url" == "$UPDATE_BASE_URL/"* ]]; then
+    rel="${url#"$UPDATE_BASE_URL/"}"
+  fi
+
+  local candidates=()
+  if [ -n "$rel" ]; then
+    local base
+    for base in "${BASE_URLS[@]}"; do
+      [ -n "$base" ] && candidates+=("$base/$rel")
+    done
+  else
+    candidates+=("$url")
+  fi
+
+  local last_rc=0
+  local last_err=""
+
+  for cand in "${candidates[@]}"; do
+    local base_used=""
+    if [ -n "$rel" ]; then
+      base_used="${cand%/$rel}"
+    else
+      base_used="$(echo "$cand" | awk -F/ '{print $1"//"$3}')"
+    fi
+
+    local host
+    host="$(url_host "$cand")"
+
+    local auth_args=()
+    if host_requires_auth "$host"; then
+      if [ -z "${SA_USER:-}" ] || [ -z "${SA_PASS:-}" ]; then
+        last_err="Auth required for $host but credentials missing (AUTH_FILE)."
+        last_rc=22
+        continue
+      fi
+      auth_args=(--user "$SA_USER:$SA_PASS")
+    fi
+
+    local tmp_path="${out_path}.part"
+    local errfile="/tmp/sa_curl_err_${$}.txt"
+    rm -f "$tmp_path" "$errfile" >/dev/null 2>&1
+
+    # Probe size (best effort)
+    local total=""
+    total="$(curl -fsSIL "${auth_args[@]}" --connect-timeout "$WGET_TIMEOUT" --max-time "$((WGET_TIMEOUT*5))" "$cand" 2>/dev/null | awk -F': ' 'tolower($1)=="content-length"{print $2}' | tr -d '
+' | tail -n 1)"
+
+    local use_gauge=0
+    if command -v dialog >/dev/null 2>&1 && [ -n "${TERM:-}" ] && [[ "$total" =~ ^[0-9]+$ ]] && [ "$total" -ge "${PROGRESS_MIN_BYTES:-0}" ]; then
+      use_gauge=1
+    fi
+
+    if [ "$use_gauge" -eq 1 ]; then
+      # Download in background and show progress gauge by polling file size
+      (
+        curl -fsSL "${auth_args[@]}" --connect-timeout "$WGET_TIMEOUT" --max-time "$((WGET_TIMEOUT*120))" \
+          --retry "$WGET_TRIES" --retry-delay 2 --retry-connrefused \
+          "$cand" -o "$tmp_path" 2>"$errfile" &
+        pid=$!
+
+        while kill -0 "$pid" >/dev/null 2>&1; do
+          downloaded=$(stat -c%s "$tmp_path" 2>/dev/null || echo 0)
+          if [[ "$downloaded" =~ ^[0-9]+$ ]] && [ "$downloaded" -ge 0 ]; then
+            pct=$(( downloaded * 100 / total ))
+            [ "$pct" -gt 99 ] && pct=99
+          else
+            pct=0
+          fi
+
+          echo "$pct"
+          echo "XXX"
+          echo "Downloading: $(basename "$cand")
+$(human_bytes "$downloaded") of $(human_bytes "$total")"
+          echo "XXX"
+          sleep 0.5
+        done
+
+        wait "$pid"
+        rc=$?
+
+        # Finalize gauge
+        downloaded=$(stat -c%s "$tmp_path" 2>/dev/null || echo 0)
+        if [ "$rc" -eq 0 ]; then
+          echo "100"
+          echo "XXX"
+          echo "Download complete: $(basename "$cand")
+$(human_bytes "$downloaded")"
+          echo "XXX"
+          sleep 0.7
+        fi
+
+        exit "$rc"
+      ) | dialog --title "Downloading Update" --gauge "Starting download...
+$(basename "$cand")
+Size: $(human_bytes "$total")" 12 70 0
+      rc=$?
+    else
+      # Quiet download
+      curl -fsSL "${auth_args[@]}" --connect-timeout "$WGET_TIMEOUT" --max-time "$((WGET_TIMEOUT*120))" \
+        --retry "$WGET_TRIES" --retry-delay 2 --retry-connrefused \
+        "$cand" -o "$tmp_path" 2>"$errfile"
+      rc=$?
+    fi
+
+    if [ "$rc" -eq 0 ] && [ -s "$tmp_path" ]; then
+      mv -f "$tmp_path" "$out_path" >/dev/null 2>&1
+      LAST_DOWNLOAD_BASE="$base_used"
+      LAST_DOWNLOAD_URL="$cand"
+      LAST_DOWNLOAD_ERROR=""
+      rm -f "$errfile" >/dev/null 2>&1
+      return 0
+    fi
+
+    last_rc=$rc
+    if [ -f "$errfile" ]; then
+      last_err="$(tail -n 1 "$errfile" | tr -d '
+')"
+    else
+      last_err="curl failed (rc=$rc)"
+    fi
+
+    # Clean partial
+    rm -f "$tmp_path" "$errfile" >/dev/null 2>&1
+  done
+
+  # Summarize failure
+  case "$last_rc" in
+    6) LAST_DOWNLOAD_ERROR="DNS lookup failed (no internet or DNS).";;
+    7) LAST_DOWNLOAD_ERROR="Connection failed (server down or blocked).";;
+    22) LAST_DOWNLOAD_ERROR="Server rejected the request (auth/404/HTTP error).";;
+    28) LAST_DOWNLOAD_ERROR="Connection timed out.";;
+    *) LAST_DOWNLOAD_ERROR="Download failed.";;
+  esac
+
+  if [ -n "$last_err" ]; then
+    LAST_DOWNLOAD_ERROR="$LAST_DOWNLOAD_ERROR
+Details: $last_err"
+  fi
+
+  log_update "Download failed: $url"
+  log_update "$LAST_DOWNLOAD_ERROR"
+  rm -f "$out_path" >/dev/null 2>&1
+  return 1
 }
+
 
 is_valid_update_filename() {
   local f="$1"
@@ -246,7 +499,8 @@ verify_checksum_for_download() {
 
   [ "$CHECKSUM_VERIFY_ENABLED" -ne 1 ] && return 0
 
-  local checksum_url="$UPDATE_BASE_URL/$filename.sha256"
+  local base_url="${3:-${LAST_DOWNLOAD_BASE:-$UPDATE_BASE_URL}}"
+  local checksum_url="$base_url/$filename.sha256"
   local checksum_path="$tmpdir/$filename.sha256"
 
   log_update "Downloading checksum: $checksum_url"
@@ -578,7 +832,7 @@ fetch_updates() {
   log_update "Fetching update list: $UPDATE_BASE_URL/update_version_list.txt"
   if ! download_file "$UPDATE_BASE_URL/update_version_list.txt" /tmp/update_version_list.txt; then
     log_update "Failed to fetch update list."
-    show_message "Failed to fetch the update list.\n\nCheck WiFi / internet connection."
+    show_message "Failed to fetch the update list.\n\n${LAST_DOWNLOAD_ERROR:-Check WiFi / internet connection.}"
     return 1
   fi
   return 0
